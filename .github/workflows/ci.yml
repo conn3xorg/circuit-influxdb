@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Conn3x
+        env: &gh
+          GH_TOKEN: ${{ github.token }}
+        run: &install |
+          tag=$(gh release view -R conn3xorg/conn3x --json tagName -q .tagName)
+          file="conn3x_${tag#v}_linux_amd64.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -sSfLO "https://github.com/conn3xorg/conn3x/releases/download/$tag/$file"
+          curl -sSfLO "https://github.com/conn3xorg/conn3x/releases/download/$tag/checksums.txt"
+          grep " $file\$" checksums.txt | sha256sum -c -
+          mkdir -p bin && tar -xzf "$file" -C bin conn3x
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: conn3x version
+      - run: conn3x fmt -check -recursive
+      - name: Validate
+        run: conn3x init -backend=false && conn3x validate
+      - name: Validate the example
+        working-directory: examples/local
+        run: conn3x init -backend=false && conn3x validate
+
+  e2e:
+    needs: validate
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [rocky10, fedora45, ubuntu2404, debian13]
+    name: e2e (${{ matrix.distro }})
+    env:
+      # A throwaway token for the throwaway server, so CI can look for it in state.
+      TF_VAR_admin_token: apiv3_ci-only-token-0123456789abcdefghijklmnop
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The test host images live in the Conn3x repo.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: conn3xorg/conn3x
+          ref: main
+          path: conn3x
+          persist-credentials: false
+          sparse-checkout: test/images
+      - name: Install Conn3x
+        env: *gh
+        run: *install
+      - name: Start the ${{ matrix.distro }} host
+        working-directory: examples/local
+        env:
+          CONTAINERFILE: ${{ github.workspace }}/conn3x/test/images/${{ matrix.distro }}/Containerfile
+          # The unit's sandbox needs a privileged host container, simplest
+          # under rootful Podman.
+          PODMAN: sudo podman
+        run: ./up.sh
+      - name: Apply the previous release, then plan again with no changes
+        working-directory: examples/local
+        run: |
+          conn3x init
+          conn3x apply -auto-approve -var influxdb_version=3.12.1
+          conn3x plan -detailed-exitcode -var influxdb_version=3.12.1
+      # Writes a point with the admin token and reads it back over SQL. A
+      # request without the token is refused.
+      - name: Write a point and query it back
+        run: |
+          sudo podman exec -i -e TOKEN="$TF_VAR_admin_token" circuit-influxdb sh -eu <<'EOF'
+          printf 'Authorization: Bearer %s\n' "$TOKEN" > /root/auth-header
+          curl -sSf -H @/root/auth-header -X POST 'http://127.0.0.1:8181/api/v3/write_lp?db=ci' --data-binary 'cpu,host=box usage=42.5'
+          curl -sSf -H @/root/auth-header 'http://127.0.0.1:8181/api/v3/query_sql?db=ci&q=SELECT+usage+FROM+cpu' | grep -q '"usage":42.5'
+          [ "$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:8181/api/v3/query_sql?db=ci&q=SELECT+1')" = 401 ]
+          EOF
+      - name: Upgrade to the current release, then read the point again
+        working-directory: examples/local
+        run: |
+          conn3x apply -auto-approve
+          conn3x plan -detailed-exitcode
+          sudo podman exec circuit-influxdb influxdb3 --version | grep -q ' 3\.12\.2,'
+          sudo podman exec circuit-influxdb curl -sSf -H @/root/auth-header 'http://127.0.0.1:8181/api/v3/query_sql?db=ci&q=SELECT+usage+FROM+cpu' | grep -q '"usage":42.5'
+      # The token reaches the host write-only, so state holds none of it, and
+      # nothing Conn3x writes under .terraform does either. .terraform/modules
+      # is left out: it holds downloaded module code.
+      - name: Check the admin token stays out of state
+        working-directory: examples/local
+        run: |
+          if grep -rqF --exclude-dir=modules -e "$TF_VAR_admin_token" terraform.tfstate .terraform/; then
+            echo "The example's admin token is in terraform.tfstate or under .terraform/." >&2
+            exit 1
+          fi
+      # Restarting the container boots systemd again, so this checks InfluxDB
+      # is enabled and comes back with its token and data.
+      - name: Restart the host, then read the point again
+        run: |
+          sudo podman restart circuit-influxdb
+          for _ in $(seq 60); do
+            case $(sudo podman exec circuit-influxdb systemctl is-system-running 2>/dev/null) in running|degraded) break ;; esac
+            sleep 1
+          done
+          sudo podman exec circuit-influxdb systemctl is-active influxdb3-core
+          sudo podman exec -i circuit-influxdb sh -eu <<'EOF'
+          q='http://127.0.0.1:8181/api/v3/query_sql?db=ci&q=SELECT+usage+FROM+cpu'
+          for _ in $(seq 60); do
+            curl -sf -H @/root/auth-header "$q" >/dev/null && break
+            sleep 1
+          done
+          curl -sSf -H @/root/auth-header "$q" | grep -q '"usage":42.5'
+          EOF
+      - name: Plan again after the restart, with no changes
+        working-directory: examples/local
+        run: conn3x plan -detailed-exitcode
+      - name: Clean up
+        if: always()
+        working-directory: examples/local
+        env:
+          PODMAN: sudo podman
+        run: ./down.sh
