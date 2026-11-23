@@ -16,7 +16,7 @@ Core is a different database from InfluxDB 2, not an upgrade of it. It speaks SQ
 
 ```hcl
 module "influxdb" {
-  source = "github.com/conn3xorg/circuit-influxdb?ref=v0.1.0"
+  source = "github.com/conn3xorg/circuit-influxdb?ref=v0.2.0"
 
   hosts                = { metrics = "192.168.1.30" }
   ssh_private_key_file = "~/.ssh/id_ed25519"
