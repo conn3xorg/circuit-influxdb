@@ -127,7 +127,7 @@ The `os` in a host object, one of `debian`, `ubuntu`, `rocky`, `almalinux`, `rhe
 
 ## Requirements
 
-Requires Conn3x v0.7.0 or later and systemd on each host, with outbound HTTPS to repos.influxdata.com. InfluxData builds packages for x86_64 and aarch64.
+Requires Conn3x v0.28.0 or later and systemd on each host, with outbound HTTPS to repos.influxdata.com. InfluxData builds packages for x86_64 and aarch64.
 
 ## Tested on
 
