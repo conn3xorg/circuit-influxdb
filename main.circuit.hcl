@@ -128,8 +128,8 @@ circuit "influxdb" {
   # a restart. This is a step rather than a handler because handlers run
   # after every step, and the ready check has to see the new server.
   step "restart" {
-    command {
-      command  = "systemctl restart influxdb3-core"
+    service_action {
+      name     = "influxdb3-core"
       triggers = { config = conn3x_file.influxdb__config[each.key].revision, version = var.influxdb_version }
     }
   }
